@@ -5,7 +5,6 @@
 #include "src/compiler/memory-lowering.h"
 
 #include "src/codegen/interface-descriptors-inl.h"
-#include "src/compiler/access-builder.h"
 #include "src/compiler/js-graph.h"
 #include "src/compiler/linkage.h"
 #include "src/compiler/node-matchers.h"
@@ -13,7 +12,7 @@
 #include "src/compiler/node.h"
 #include "src/compiler/simplified-operator.h"
 #include "src/roots/roots-inl.h"
-#include "src/sandbox/external-pointer.h"
+#include "src/sandbox/external-pointer-inl.h"
 
 #if V8_ENABLE_WEBASSEMBLY
 #include "src/wasm/wasm-linkage.h"
@@ -406,13 +405,13 @@ Reduction MemoryLowering::ReduceLoadElement(Node* node) {
   return Changed(node);
 }
 
-Node* MemoryLowering::DecodeExternalPointer(
-    Node* node, ExternalPointerTag external_pointer_tag) {
 #ifdef V8_SANDBOXED_EXTERNAL_POINTERS
+Node* MemoryLowering::ReduceLoadExternalPointerField(Node* node,
+                                                     ExternalPointerTag tag) {
   DCHECK(V8_SANDBOXED_EXTERNAL_POINTERS_BOOL);
   DCHECK(node->opcode() == IrOpcode::kLoad);
   DCHECK_EQ(kExternalPointerSize, kUInt32Size);
-  DCHECK_NE(kExternalPointerNullTag, external_pointer_tag);
+  DCHECK_NE(kExternalPointerNullTag, tag);
   Node* effect = NodeProperties::GetEffectInput(node);
   Node* control = NodeProperties::GetControlInput(node);
   __ InitializeEffectControl(effect, control);
@@ -420,7 +419,7 @@ Node* MemoryLowering::DecodeExternalPointer(
   // Clone the load node and put it here.
   // TODO(turbofan): consider adding GraphAssembler::Clone() suitable for
   // cloning nodes from arbitrary locaions in effect/control chains.
-  STATIC_ASSERT(kExternalPointerIndexShift > kSystemPointerSizeLog2);
+  static_assert(kExternalPointerIndexShift > kSystemPointerSizeLog2);
   Node* shifted_index = __ AddNode(graph()->CloneNode(node));
   Node* shift_amount =
       __ Int32Constant(kExternalPointerIndexShift - kSystemPointerSizeLog2);
@@ -437,19 +436,25 @@ Node* MemoryLowering::DecodeExternalPointer(
   // the generated code is never executed under a different Isolate, as that
   // would allow access to external objects from different Isolates. It also
   // would break if the code is serialized/deserialized at some point.
-  Node* table_address = __ ExternalConstant(
-      ExternalReference::external_pointer_table_address(isolate()));
+  Node* table_address =
+      IsExternalPointerTagShareable(tag)
+          ? __
+            Load(MachineType::Pointer(),
+                 __ ExternalConstant(
+                     ExternalReference::
+                         shared_external_pointer_table_address_address(
+                             isolate())),
+                 __ IntPtrConstant(0))
+          : __ ExternalConstant(
+                ExternalReference::external_pointer_table_address(isolate()));
   Node* table = __ Load(MachineType::Pointer(), table_address,
                         Internals::kExternalPointerTableBufferOffset);
-  Node* decoded_ptr =
+  Node* pointer =
       __ Load(MachineType::Pointer(), table, __ ChangeUint32ToUint64(offset));
-  Node* tag = __ IntPtrConstant(~external_pointer_tag);
-  decoded_ptr = __ WordAnd(decoded_ptr, tag);
-  return decoded_ptr;
-#else
-  return node;
-#endif  // V8_SANDBOXED_EXTERNAL_POINTERS
+  pointer = __ WordAnd(pointer, __ IntPtrConstant(~tag));
+  return pointer;
 }
+#endif  // V8_SANDBOXED_EXTERNAL_POINTERS
 
 Reduction MemoryLowering::ReduceLoadMap(Node* node) {
 #ifdef V8_MAP_PACKING
@@ -490,7 +495,7 @@ Reduction MemoryLowering::ReduceLoadField(Node* node) {
   if (access.type.Is(Type::ExternalPointer())) {
     ExternalPointerTag tag = access.external_pointer_tag;
     DCHECK_NE(kExternalPointerNullTag, tag);
-    node = DecodeExternalPointer(node, tag);
+    node = ReduceLoadExternalPointerField(node, tag);
     return Replace(node);
   }
 #endif

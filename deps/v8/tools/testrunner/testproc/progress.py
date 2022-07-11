@@ -4,14 +4,12 @@
 
 import datetime
 import json
-import os
 import platform
 import sys
 import time
 
 from . import base
 from . import util
-from ..local import junit_output
 
 
 def print_failure_header(test, is_flaky=False):
@@ -26,6 +24,10 @@ def print_failure_header(test, is_flaky=False):
 
 
 class ResultsTracker(base.TestProcObserver):
+  @staticmethod
+  def create(options):
+    return ResultsTracker(options.exit_after_n_failures)
+
   """Tracks number of results and stops to run tests if max_failures reached."""
   def __init__(self, max_failures):
     super(ResultsTracker, self).__init__()
@@ -59,6 +61,10 @@ class ProgressIndicator(base.TestProcObserver):
 
   def configure(self, options):
     self.options = options
+
+  def set_test_count(self, test_count):
+    self._total = test_count
+
 
 
 class SimpleProgressIndicator(ProgressIndicator):
@@ -248,9 +254,6 @@ class CompactProgressIndicator(ProgressIndicator):
     self._passed = 0
     self._failed = 0
 
-  def set_test_count(self, test_count):
-    self._total = test_count
-
   def _on_result_for(self, test, result):
     # TODO(majeski): Support for dummy/grouped results
     if result.has_unexpected_output:
@@ -359,45 +362,6 @@ class MonochromeProgressIndicator(CompactProgressIndicator):
 
   def _clear_line(self, last_length):
     print(("\r" + (" " * last_length) + "\r"), end='')
-
-
-class JUnitTestProgressIndicator(ProgressIndicator):
-  def __init__(self, junitout, junittestsuite):
-    super(JUnitTestProgressIndicator, self).__init__()
-    self._requirement = base.DROP_PASS_STDOUT
-
-    self.outputter = junit_output.JUnitTestOutput(junittestsuite)
-    if junitout:
-      self.outfile = open(junitout, "wb")
-    else:
-      self.outfile = sys.stdout
-
-  def _on_result_for(self, test, result):
-    # TODO(majeski): Support for dummy/grouped results
-    fail_text = ""
-    output = result.output
-    if result.has_unexpected_output:
-      stdout = output.stdout.strip()
-      if len(stdout):
-        fail_text += "stdout:\n%s\n" % stdout
-      stderr = output.stderr.strip()
-      if len(stderr):
-        fail_text += "stderr:\n%s\n" % stderr
-      fail_text += "Command: %s" % result.cmd.to_string()
-      if output.HasCrashed():
-        fail_text += "exit code: %d\n--- CRASHED ---" % output.exit_code
-      if output.HasTimedOut():
-        fail_text += "--- TIMEOUT ---"
-    self.outputter.HasRunTest(
-        test_name=str(test),
-        test_cmd=result.cmd.to_string(relative=True),
-        test_duration=output.duration,
-        test_failure=fail_text)
-
-  def finished(self):
-    self.outputter.FinishAndWrite(self.outfile)
-    if self.outfile != sys.stdout:
-      self.outfile.close()
 
 
 class JsonTestProgressIndicator(ProgressIndicator):

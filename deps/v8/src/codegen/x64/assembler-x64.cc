@@ -371,7 +371,7 @@ Assembler::Assembler(const AssemblerOptions& options,
 }
 
 void Assembler::GetCode(Isolate* isolate, CodeDesc* desc,
-                        SafepointTableBuilder* safepoint_table_builder,
+                        SafepointTableBuilderBase* safepoint_table_builder,
                         int handler_table_offset) {
   // As a crutch to avoid having to add manual Align calls wherever we use a
   // raw workflow to create Code objects (mostly in tests), add another Align
@@ -408,6 +408,7 @@ void Assembler::GetCode(Isolate* isolate, CodeDesc* desc,
       (safepoint_table_builder == kNoSafepointTable)
           ? handler_table_offset2
           : safepoint_table_builder->safepoint_table_offset();
+
   const int reloc_info_offset =
       static_cast<int>(reloc_info_writer.pos() - buffer_->start());
   CodeDesc::Initialize(desc, this, safepoint_table_offset,
@@ -1068,14 +1069,6 @@ void Assembler::cdq() {
 }
 
 void Assembler::cmovq(Condition cc, Register dst, Register src) {
-  if (cc == always) {
-    movq(dst, src);
-  } else if (cc == never) {
-    return;
-  }
-  // No need to check CpuInfo for CMOV support, it's a required part of the
-  // 64-bit architecture.
-  DCHECK_GE(cc, 0);  // Use mov for unconditional moves.
   EnsureSpace ensure_space(this);
   // Opcode: REX.W 0f 40 + cc /r.
   emit_rex_64(dst, src);
@@ -1085,12 +1078,6 @@ void Assembler::cmovq(Condition cc, Register dst, Register src) {
 }
 
 void Assembler::cmovq(Condition cc, Register dst, Operand src) {
-  if (cc == always) {
-    movq(dst, src);
-  } else if (cc == never) {
-    return;
-  }
-  DCHECK_GE(cc, 0);
   EnsureSpace ensure_space(this);
   // Opcode: REX.W 0f 40 + cc /r.
   emit_rex_64(dst, src);
@@ -1100,12 +1087,6 @@ void Assembler::cmovq(Condition cc, Register dst, Operand src) {
 }
 
 void Assembler::cmovl(Condition cc, Register dst, Register src) {
-  if (cc == always) {
-    movl(dst, src);
-  } else if (cc == never) {
-    return;
-  }
-  DCHECK_GE(cc, 0);
   EnsureSpace ensure_space(this);
   // Opcode: 0f 40 + cc /r.
   emit_optional_rex_32(dst, src);
@@ -1115,12 +1096,6 @@ void Assembler::cmovl(Condition cc, Register dst, Register src) {
 }
 
 void Assembler::cmovl(Condition cc, Register dst, Operand src) {
-  if (cc == always) {
-    movl(dst, src);
-  } else if (cc == never) {
-    return;
-  }
-  DCHECK_GE(cc, 0);
   EnsureSpace ensure_space(this);
   // Opcode: 0f 40 + cc /r.
   emit_optional_rex_32(dst, src);
@@ -1358,12 +1333,6 @@ void Assembler::int3() {
 }
 
 void Assembler::j(Condition cc, Label* L, Label::Distance distance) {
-  if (cc == always) {
-    jmp(L, distance);
-    return;
-  } else if (cc == never) {
-    return;
-  }
   EnsureSpace ensure_space(this);
   DCHECK(is_uint4(cc));
   if (L->is_bound()) {
@@ -1443,12 +1412,6 @@ void Assembler::j(Condition cc, Address entry, RelocInfo::Mode rmode) {
 }
 
 void Assembler::j(Condition cc, Handle<CodeT> target, RelocInfo::Mode rmode) {
-  if (cc == always) {
-    jmp(target, rmode);
-    return;
-  } else if (cc == never) {
-    return;
-  }
   EnsureSpace ensure_space(this);
   DCHECK(is_uint4(cc));
   // 0000 1111 1000 tttn #32-bit disp.
@@ -2146,10 +2109,6 @@ void Assembler::ud2() {
 }
 
 void Assembler::setcc(Condition cc, Register reg) {
-  if (cc > last_condition) {
-    movb(reg, Immediate(cc == always ? 1 : 0));
-    return;
-  }
   EnsureSpace ensure_space(this);
   DCHECK(is_uint4(cc));
   if (!reg.is_byte_register()) {
@@ -3807,26 +3766,27 @@ void Assembler::vps(byte op, YMMRegister dst, YMMRegister src1,
   emit(imm8);
 }
 
-#define VPD(SIMDRegister, length)                                   \
-  void Assembler::vpd(byte op, SIMDRegister dst, SIMDRegister src1, \
-                      SIMDRegister src2) {                          \
-    DCHECK(IsEnabled(AVX));                                         \
-    EnsureSpace ensure_space(this);                                 \
-    emit_vex_prefix(dst, src1, src2, k##length, k66, k0F, kWIG);    \
-    emit(op);                                                       \
-    emit_sse_operand(dst, src2);                                    \
-  }                                                                 \
-                                                                    \
-  void Assembler::vpd(byte op, SIMDRegister dst, SIMDRegister src1, \
-                      Operand src2) {                               \
-    DCHECK(IsEnabled(AVX));                                         \
-    EnsureSpace ensure_space(this);                                 \
-    emit_vex_prefix(dst, src1, src2, k##length, k66, k0F, kWIG);    \
-    emit(op);                                                       \
-    emit_sse_operand(dst, src2);                                    \
+#define VPD(DSTRegister, SRCRegister, length)                     \
+  void Assembler::vpd(byte op, DSTRegister dst, SRCRegister src1, \
+                      SRCRegister src2) {                         \
+    DCHECK(IsEnabled(AVX));                                       \
+    EnsureSpace ensure_space(this);                               \
+    emit_vex_prefix(dst, src1, src2, k##length, k66, k0F, kWIG);  \
+    emit(op);                                                     \
+    emit_sse_operand(dst, src2);                                  \
+  }                                                               \
+                                                                  \
+  void Assembler::vpd(byte op, DSTRegister dst, SRCRegister src1, \
+                      Operand src2) {                             \
+    DCHECK(IsEnabled(AVX));                                       \
+    EnsureSpace ensure_space(this);                               \
+    emit_vex_prefix(dst, src1, src2, k##length, k66, k0F, kWIG);  \
+    emit(op);                                                     \
+    emit_sse_operand(dst, src2);                                  \
   }
-VPD(XMMRegister, L128)
-VPD(YMMRegister, L256)
+VPD(XMMRegister, XMMRegister, L128)
+VPD(XMMRegister, YMMRegister, L256)
+VPD(YMMRegister, YMMRegister, L256)
 #undef VPD
 
 void Assembler::vucomiss(XMMRegister dst, XMMRegister src) {

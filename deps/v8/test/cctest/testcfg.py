@@ -56,7 +56,21 @@ class TestLoader(testsuite.TestLoader):
       print(output.stderr)
       return []
 
-    return sorted(output.stdout.strip().split())
+    filtered_output = []
+    test_prefix = '**>Test: '
+    test_total_prefix = 'Total number of tests: '
+    tests_total = 0
+
+    for line in output.stdout.strip().splitlines():
+      if line.startswith(test_prefix):
+        filtered_output.append(line[len(test_prefix):])
+      if line.startswith(test_total_prefix):
+        tests_total = int(line[len(test_total_prefix):])
+
+    assert (len(filtered_output) > 0)
+    assert (len(filtered_output) == tests_total)
+
+    return sorted(filtered_output)
 
 
 class TestSuite(testsuite.TestSuite):
@@ -73,18 +87,6 @@ class TestCase(testcase.TestCase):
 
   def _get_files_params(self):
     return [self.path]
-
-  def _get_resources(self):
-    # Bytecode-generator tests are the only ones requiring extra files on
-    # Android.
-    parts = self.name.split('/')
-    if parts[0] == 'test-bytecode-generator':
-      expectation_file = os.path.join(
-          self.suite.root, 'interpreter', 'bytecode_expectations',
-          '%s.golden' % parts[1])
-      if os.path.exists(expectation_file):
-        return [expectation_file]
-    return []
 
 
 def GetSuite(*args, **kwargs):

@@ -300,7 +300,7 @@ class V8_EXPORT_PRIVATE InstructionSelector final {
       EnableTraceTurboJson trace_turbo = kDisableTraceTurboJson);
 
   // Visit code for the entire graph with the included schedule.
-  bool SelectInstructions();
+  base::Optional<BailoutReason> SelectInstructions();
 
   void StartBlock(RpoNumber rpo);
   void EndBlock(RpoNumber rpo);
@@ -407,15 +407,12 @@ class V8_EXPORT_PRIVATE InstructionSelector final {
   // Used in pattern matching during code generation.
   // Check if {node} can be covered while generating code for the current
   // instruction. A node can be covered if the {user} of the node has the only
-  // edge and the two are in the same basic block.
-  // Before fusing two instructions a and b, it is useful to check that
-  // CanCover(a, b) holds. If this is not the case, code for b must still be
-  // generated for other users, and fusing is unlikely to improve performance.
+  // edge, the two are in the same basic block, and there are no side-effects
+  // in-between. The last check is crucial for soundness.
+  // For pure nodes, CanCover(a,b) is checked to avoid duplicated execution:
+  // If this is not the case, code for b must still be generated for other
+  // users, and fusing is unlikely to improve performance.
   bool CanCover(Node* user, Node* node) const;
-  // CanCover is not transitive.  The counter example are Nodes A,B,C such that
-  // CanCover(A, B) and CanCover(B,C) and B is pure: The the effect level of A
-  // and B might differ. CanCoverTransitively does the additional checks.
-  bool CanCoverTransitively(Node* user, Node* node, Node* node_input) const;
 
   // Used in pattern matching during code generation.
   // This function checks that {node} and {user} are in the same basic block,
@@ -640,6 +637,16 @@ class V8_EXPORT_PRIVATE InstructionSelector final {
   void EmitPrepareResults(ZoneVector<compiler::PushParameter>* results,
                           const CallDescriptor* call_descriptor, Node* node);
 
+  // In LOONG64, calling convention uses free GP param register to pass
+  // floating-point arguments when no FP param register is available. But
+  // gap does not support moving from FPR to GPR, so we add EmitMoveFPRToParam
+  // to complete movement.
+  void EmitMoveFPRToParam(InstructionOperand* op, LinkageLocation location);
+  // Moving floating-point param from GP param register to FPR to participate in
+  // subsequent operations, whether CallCFunction or normal floating-point
+  // operations.
+  void EmitMoveParamToFPR(Node* node, int index);
+
   bool CanProduceSignalingNaN(Node* node);
 
   void AddOutputToSelectContinuation(OperandGenerator* g, int first_input_index,
@@ -739,6 +746,7 @@ class V8_EXPORT_PRIVATE InstructionSelector final {
   BoolVector defined_;
   BoolVector used_;
   IntVector effect_level_;
+  int current_effect_level_;
   IntVector virtual_registers_;
   IntVector virtual_register_rename_;
   InstructionScheduler* scheduler_;

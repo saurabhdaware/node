@@ -47,37 +47,37 @@ class MarkingStateBase {
 #endif  // V8_COMPRESS_POINTERS
   }
 
-  V8_INLINE MarkBit MarkBitFrom(HeapObject obj) {
+  V8_INLINE MarkBit MarkBitFrom(const HeapObject obj) const {
     return MarkBitFrom(BasicMemoryChunk::FromHeapObject(obj), obj.ptr());
   }
 
   // {addr} may be tagged or aligned.
-  V8_INLINE MarkBit MarkBitFrom(BasicMemoryChunk* p, Address addr) {
-    return static_cast<ConcreteState*>(this)->bitmap(p)->MarkBitFromIndex(
+  V8_INLINE MarkBit MarkBitFrom(const BasicMemoryChunk* p, Address addr) const {
+    return static_cast<const ConcreteState*>(this)->bitmap(p)->MarkBitFromIndex(
         p->AddressToMarkbitIndex(addr));
   }
 
-  Marking::ObjectColor Color(HeapObject obj) {
+  Marking::ObjectColor Color(const HeapObject obj) const {
     return Marking::Color(MarkBitFrom(obj));
   }
 
-  V8_INLINE bool IsImpossible(HeapObject obj) {
+  V8_INLINE bool IsImpossible(const HeapObject obj) const {
     return Marking::IsImpossible<access_mode>(MarkBitFrom(obj));
   }
 
-  V8_INLINE bool IsBlack(HeapObject obj) {
+  V8_INLINE bool IsBlack(const HeapObject obj) const {
     return Marking::IsBlack<access_mode>(MarkBitFrom(obj));
   }
 
-  V8_INLINE bool IsWhite(HeapObject obj) {
+  V8_INLINE bool IsWhite(const HeapObject obj) const {
     return Marking::IsWhite<access_mode>(MarkBitFrom(obj));
   }
 
-  V8_INLINE bool IsGrey(HeapObject obj) {
+  V8_INLINE bool IsGrey(const HeapObject obj) const {
     return Marking::IsGrey<access_mode>(MarkBitFrom(obj));
   }
 
-  V8_INLINE bool IsBlackOrGrey(HeapObject obj) {
+  V8_INLINE bool IsBlackOrGrey(const HeapObject obj) const {
     return Marking::IsBlackOrGrey<access_mode>(MarkBitFrom(obj));
   }
 
@@ -157,7 +157,9 @@ class MarkingVisitorBase : public HeapVisitor<int, ConcreteVisitor> {
         is_shared_heap_(heap->IsShared())
 #ifdef V8_SANDBOXED_EXTERNAL_POINTERS
         ,
-        external_pointer_table_(&heap->isolate()->external_pointer_table())
+        external_pointer_table_(&heap->isolate()->external_pointer_table()),
+        shared_external_pointer_table_(
+            &heap->isolate()->shared_external_pointer_table())
 #endif  // V8_SANDBOXED_EXTERNAL_POINTERS
   {
   }
@@ -209,13 +211,8 @@ class MarkingVisitorBase : public HeapVisitor<int, ConcreteVisitor> {
     // reconstructed after GC.
   }
 
-  V8_INLINE void VisitExternalPointer(HeapObject host,
-                                      ExternalPointer_t ptr) final {
-#ifdef V8_SANDBOXED_EXTERNAL_POINTERS
-    uint32_t index = ptr >> kExternalPointerIndexShift;
-    external_pointer_table_->Mark(index);
-#endif  // V8_SANDBOXED_EXTERNAL_POINTERS
-  }
+  V8_INLINE void VisitExternalPointer(HeapObject host, ExternalPointerSlot slot,
+                                      ExternalPointerTag tag) final;
 
  protected:
   ConcreteVisitor* concrete_visitor() {
@@ -286,6 +283,7 @@ class MarkingVisitorBase : public HeapVisitor<int, ConcreteVisitor> {
   const bool is_shared_heap_;
 #ifdef V8_SANDBOXED_EXTERNAL_POINTERS
   ExternalPointerTable* const external_pointer_table_;
+  ExternalPointerTable* const shared_external_pointer_table_;
 #endif  // V8_SANDBOXED_EXTERNAL_POINTERS
 };
 

@@ -5,11 +5,9 @@
 #include "src/compiler/memory-optimizer.h"
 
 #include "src/base/logging.h"
-#include "src/codegen/interface-descriptors.h"
 #include "src/codegen/tick-counter.h"
 #include "src/compiler/js-graph.h"
 #include "src/compiler/linkage.h"
-#include "src/compiler/node-matchers.h"
 #include "src/compiler/node-properties.h"
 #include "src/compiler/node.h"
 #include "src/roots/roots-inl.h"
@@ -54,10 +52,11 @@ bool CanAllocate(const Node* node) {
     case IrOpcode::kStoreLane:
     case IrOpcode::kStoreToObject:
     case IrOpcode::kInitializeImmutableInObject:
+    case IrOpcode::kTrapIf:
+    case IrOpcode::kTrapUnless:
     case IrOpcode::kUnalignedLoad:
     case IrOpcode::kUnalignedStore:
     case IrOpcode::kUnreachable:
-    case IrOpcode::kUnsafePointerAdd:
     case IrOpcode::kWord32AtomicAdd:
     case IrOpcode::kWord32AtomicAnd:
     case IrOpcode::kWord32AtomicCompareExchange:

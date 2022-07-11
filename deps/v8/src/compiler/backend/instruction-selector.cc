@@ -95,7 +95,7 @@ InstructionSelector::InstructionSelector(
   }
 }
 
-bool InstructionSelector::SelectInstructions() {
+base::Optional<BailoutReason> InstructionSelector::SelectInstructions() {
   // Mark the inputs of all phis in loop headers as used.
   BasicBlockVector* blocks = schedule()->rpo_order();
   for (auto const block : *blocks) {
@@ -114,7 +114,8 @@ bool InstructionSelector::SelectInstructions() {
   // Visit each basic block in post order.
   for (auto i = blocks->rbegin(); i != blocks->rend(); ++i) {
     VisitBlock(*i);
-    if (instruction_selection_failed()) return false;
+    if (instruction_selection_failed())
+      return BailoutReason::kCodeGenerationFailed;
   }
 
   // Schedule the selected instructions.
@@ -145,7 +146,7 @@ bool InstructionSelector::SelectInstructions() {
 #if DEBUG
   sequence()->ValidateSSA();
 #endif
-  return true;
+  return base::nullopt;
 }
 
 void InstructionSelector::StartBlock(RpoNumber rpo) {
@@ -283,7 +284,7 @@ Instruction* InstructionSelector::Emit(Instruction* instr) {
 
 bool InstructionSelector::CanCover(Node* user, Node* node) const {
   // 1. Both {user} and {node} must be in the same basic block.
-  if (schedule()->block(node) != schedule()->block(user)) {
+  if (schedule()->block(node) != current_block_) {
     return false;
   }
   // 2. Pure {node}s must be owned by the {user}.
@@ -291,7 +292,7 @@ bool InstructionSelector::CanCover(Node* user, Node* node) const {
     return node->OwnedBy(user);
   }
   // 3. Impure {node}s must match the effect level of {user}.
-  if (GetEffectLevel(node) != GetEffectLevel(user)) {
+  if (GetEffectLevel(node) != current_effect_level_) {
     return false;
   }
   // 4. Only {node} must have value edges pointing to {user}.
@@ -301,21 +302,6 @@ bool InstructionSelector::CanCover(Node* user, Node* node) const {
     }
   }
   return true;
-}
-
-bool InstructionSelector::CanCoverTransitively(Node* user, Node* node,
-                                               Node* node_input) const {
-  if (CanCover(user, node) && CanCover(node, node_input)) {
-    // If {node} is pure, transitivity might not hold.
-    if (node->op()->HasProperty(Operator::kPure)) {
-      // If {node_input} is pure, the effect levels do not matter.
-      if (node_input->op()->HasProperty(Operator::kPure)) return true;
-      // Otherwise, {user} and {node_input} must have the same effect level.
-      return GetEffectLevel(user) == GetEffectLevel(node_input);
-    }
-    return true;
-  }
-  return false;
 }
 
 bool InstructionSelector::IsOnlyUserOfNodeInSameBlock(Node* user,
@@ -1085,7 +1071,7 @@ void InstructionSelector::InitializeCallBuffer(Node* call, CallBuffer* buffer,
         call->InputAt(static_cast<int>(buffer->descriptor->InputCount()))};
 
     // If it was a syntactic tail call we need to drop the current frame and
-    // all the frames on top of it that are either an arguments adaptor frame
+    // all the frames on top of it that are either inlined extra arguments
     // or a tail caller frame.
     if (is_tail_call) {
       frame_state = FrameState{NodeProperties::GetFrameStateInput(frame_state)};
@@ -1093,7 +1079,7 @@ void InstructionSelector::InitializeCallBuffer(Node* call, CallBuffer* buffer,
           buffer->frame_state_descriptor->outer_state();
       while (buffer->frame_state_descriptor != nullptr &&
              buffer->frame_state_descriptor->type() ==
-                 FrameStateType::kArgumentsAdaptor) {
+                 FrameStateType::kInlinedExtraArguments) {
         frame_state =
             FrameState{NodeProperties::GetFrameStateInput(frame_state)};
         buffer->frame_state_descriptor =
@@ -1150,6 +1136,9 @@ void InstructionSelector::InitializeCallBuffer(Node* call, CallBuffer* buffer,
       buffer->pushed_nodes[stack_index] = param;
       pushed_count++;
     } else {
+      if (location.IsNullRegister()) {
+        EmitMoveFPRToParam(&op, location);
+      }
       buffer->instruction_args.push_back(op);
     }
   }
@@ -1192,6 +1181,7 @@ void InstructionSelector::VisitBlock(BasicBlock* block) {
   int effect_level = 0;
   for (Node* const node : *block) {
     SetEffectLevel(node, effect_level);
+    current_effect_level_ = effect_level;
     if (node->opcode() == IrOpcode::kStore ||
         node->opcode() == IrOpcode::kUnalignedStore ||
         node->opcode() == IrOpcode::kCall ||
@@ -1209,6 +1199,7 @@ void InstructionSelector::VisitBlock(BasicBlock* block) {
   // control input should be on the same effect level as the last node.
   if (block->control_input() != nullptr) {
     SetEffectLevel(block->control_input(), effect_level);
+    current_effect_level_ = effect_level;
   }
 
   auto FinishEmittedInstructions = [&](Node* node, int instruction_start) {
@@ -1665,6 +1656,10 @@ void InstructionSelector::VisitNode(Node* node) {
       return MarkAsWord64(node), VisitTryTruncateFloat32ToUint64(node);
     case IrOpcode::kTryTruncateFloat64ToUint64:
       return MarkAsWord64(node), VisitTryTruncateFloat64ToUint64(node);
+    case IrOpcode::kTryTruncateFloat64ToInt32:
+      return MarkAsWord32(node), VisitTryTruncateFloat64ToInt32(node);
+    case IrOpcode::kTryTruncateFloat64ToUint32:
+      return MarkAsWord32(node), VisitTryTruncateFloat64ToUint32(node);
     case IrOpcode::kBitcastWord32ToWord64:
       return MarkAsWord64(node), VisitBitcastWord32ToWord64(node);
     case IrOpcode::kChangeInt32ToInt64:
@@ -1937,9 +1932,6 @@ void InstructionSelector::VisitNode(Node* node) {
       return MarkAsWord64(node), VisitSignExtendWord16ToInt64(node);
     case IrOpcode::kSignExtendWord32ToInt64:
       return MarkAsWord64(node), VisitSignExtendWord32ToInt64(node);
-    case IrOpcode::kUnsafePointerAdd:
-      MarkAsRepresentation(MachineType::PointerRepresentation(), node);
-      return VisitUnsafePointerAdd(node);
     case IrOpcode::kF64x2Splat:
       return MarkAsSimd128(node), VisitF64x2Splat(node);
     case IrOpcode::kF64x2ExtractLane:
@@ -2010,10 +2002,6 @@ void InstructionSelector::VisitNode(Node* node) {
       return MarkAsSimd128(node), VisitF32x4Neg(node);
     case IrOpcode::kF32x4Sqrt:
       return MarkAsSimd128(node), VisitF32x4Sqrt(node);
-    case IrOpcode::kF32x4RecipApprox:
-      return MarkAsSimd128(node), VisitF32x4RecipApprox(node);
-    case IrOpcode::kF32x4RecipSqrtApprox:
-      return MarkAsSimd128(node), VisitF32x4RecipSqrtApprox(node);
     case IrOpcode::kF32x4Add:
       return MarkAsSimd128(node), VisitF32x4Add(node);
     case IrOpcode::kF32x4Sub:
@@ -2374,6 +2362,12 @@ void InstructionSelector::VisitNode(Node* node) {
       return MarkAsSimd128(node), VisitI32x4RelaxedTruncF32x4S(node);
     case IrOpcode::kI32x4RelaxedTruncF32x4U:
       return MarkAsSimd128(node), VisitI32x4RelaxedTruncF32x4U(node);
+    case IrOpcode::kI16x8RelaxedQ15MulRS:
+      return MarkAsSimd128(node), VisitI16x8RelaxedQ15MulRS(node);
+    case IrOpcode::kI16x8DotI8x16I7x16S:
+      return MarkAsSimd128(node), VisitI16x8DotI8x16I7x16S(node);
+    case IrOpcode::kI32x4DotI8x16I7x16AddS:
+      return MarkAsSimd128(node), VisitI32x4DotI8x16I7x16AddS(node);
     default:
       FATAL("Unexpected operator #%d:%s @ node #%d", node->opcode(),
             node->op()->mnemonic(), node->id());
@@ -2638,6 +2632,14 @@ void InstructionSelector::VisitTryTruncateFloat64ToUint64(Node* node) {
   UNIMPLEMENTED();
 }
 
+void InstructionSelector::VisitTryTruncateFloat64ToInt32(Node* node) {
+  UNIMPLEMENTED();
+}
+
+void InstructionSelector::VisitTryTruncateFloat64ToUint32(Node* node) {
+  UNIMPLEMENTED();
+}
+
 void InstructionSelector::VisitTruncateInt64ToInt32(Node* node) {
   UNIMPLEMENTED();
 }
@@ -2826,24 +2828,39 @@ void InstructionSelector::VisitI32x4RelaxedTruncF32x4U(Node* node) {
 #endif  // !V8_TARGET_ARCH_X64 && !V8_TARGET_ARCH_IA32 && !V8_TARGET_ARCH_ARM64
         // && !V8_TARGET_ARCH_RISCV64 && !V8_TARGET_ARM
 
-#if !V8_TARGET_ARCH_X64 && !V8_TARGET_ARCH_IA32 && !V8_TARGET_ARCH_ARM64 && \
-    !V8_TARGET_ARCH_RISCV64
-#endif  // !V8_TARGET_ARCH_X64 && !V8_TARGET_ARCH_IA32 && !V8_TARGET_ARCH_ARM64
-        // && !V8_TARGET_ARCH_RISCV64
+#if !V8_TARGET_ARCH_ARM64 && !V8_TARGET_ARCH_ARM
+void InstructionSelector::VisitI16x8RelaxedQ15MulRS(Node* node) {
+  UNIMPLEMENTED();
+}
+#endif  // !V8_TARGET_ARCH_ARM6 && !V8_TARGET_ARCH_ARM
+
+#if !V8_TARGET_ARCH_ARM64
+void InstructionSelector::VisitI16x8DotI8x16I7x16S(Node* node) {
+  UNIMPLEMENTED();
+}
+
+void InstructionSelector::VisitI32x4DotI8x16I7x16AddS(Node* node) {
+  UNIMPLEMENTED();
+}
+#endif  // !V8_TARGET_ARCH_ARM6
 
 void InstructionSelector::VisitFinishRegion(Node* node) { EmitIdentity(node); }
 
 void InstructionSelector::VisitParameter(Node* node) {
   OperandGenerator g(this);
   int index = ParameterIndexOf(node->op());
-  InstructionOperand op =
-      linkage()->ParameterHasSecondaryLocation(index)
-          ? g.DefineAsDualLocation(
-                node, linkage()->GetParameterLocation(index),
-                linkage()->GetParameterSecondaryLocation(index))
-          : g.DefineAsLocation(node, linkage()->GetParameterLocation(index));
 
-  Emit(kArchNop, op);
+  if (linkage()->GetParameterLocation(index).IsNullRegister()) {
+    EmitMoveParamToFPR(node, index);
+  } else {
+    InstructionOperand op =
+        linkage()->ParameterHasSecondaryLocation(index)
+            ? g.DefineAsDualLocation(
+                  node, linkage()->GetParameterLocation(index),
+                  linkage()->GetParameterSecondaryLocation(index))
+            : g.DefineAsLocation(node, linkage()->GetParameterLocation(index));
+    Emit(kArchNop, op);
+  }
 }
 
 namespace {
@@ -2856,7 +2873,7 @@ LinkageLocation ExceptionLocation() {
 constexpr InstructionCode EncodeCallDescriptorFlags(
     InstructionCode opcode, CallDescriptor::Flags flags) {
   // Note: Not all bits of `flags` are preserved.
-  STATIC_ASSERT(CallDescriptor::kFlagsBitsEncodedInInstructionCode ==
+  static_assert(CallDescriptor::kFlagsBitsEncodedInInstructionCode ==
                 MiscField::kSize);
   DCHECK(Instruction::IsCallWithDescriptorFlags(opcode));
   return opcode | MiscField::encode(flags & MiscField::kMax);
@@ -2906,6 +2923,8 @@ void InstructionSelector::VisitProjection(Node* node) {
     case IrOpcode::kTryTruncateFloat64ToInt64:
     case IrOpcode::kTryTruncateFloat32ToUint64:
     case IrOpcode::kTryTruncateFloat64ToUint64:
+    case IrOpcode::kTryTruncateFloat64ToInt32:
+    case IrOpcode::kTryTruncateFloat64ToUint32:
     case IrOpcode::kInt32PairAdd:
     case IrOpcode::kInt32PairSub:
     case IrOpcode::kInt32PairMul:
@@ -2987,7 +3006,7 @@ void InstructionSelector::VisitCall(Node* node, BasicBlock* handler) {
 #if ABI_USES_FUNCTION_DESCRIPTORS
       // Highest fp_param_count bit is used on AIX to indicate if a CFunction
       // call has function descriptor or not.
-      STATIC_ASSERT(FPParamField::kSize == kHasFunctionDescriptorBitShift + 1);
+      static_assert(FPParamField::kSize == kHasFunctionDescriptorBitShift + 1);
       if (!call_descriptor->NoFunctionDescriptor()) {
         fp_param_count |= 1 << kHasFunctionDescriptorBitShift;
       }
@@ -3212,14 +3231,6 @@ void InstructionSelector::VisitComment(Node* node) {
   Emit(kArchComment, 0, nullptr, 1, &operand);
 }
 
-void InstructionSelector::VisitUnsafePointerAdd(Node* node) {
-#if V8_TARGET_ARCH_64_BIT
-  VisitInt64Add(node);
-#else   // V8_TARGET_ARCH_64_BIT
-  VisitInt32Add(node);
-#endif  // V8_TARGET_ARCH_64_BIT
-}
-
 void InstructionSelector::VisitRetain(Node* node) {
   OperandGenerator g(this);
   Emit(kArchNop, g.NoOutput(), g.UseAny(node->InputAt(0)));
@@ -3292,7 +3303,7 @@ FrameStateDescriptor* GetFrameStateDescriptorInternal(Zone* zone,
   const FrameStateInfo& state_info = FrameStateInfoOf(state->op());
   int parameters = state_info.parameter_count();
   int locals = state_info.local_count();
-  int stack = state_info.type() == FrameStateType::kUnoptimizedFunction ? 1 : 0;
+  int stack = state_info.stack_count();
 
   FrameStateDescriptor* outer_state = nullptr;
   if (state.outer_frame_state()->opcode() == IrOpcode::kFrameState) {

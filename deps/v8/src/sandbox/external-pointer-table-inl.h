@@ -10,7 +10,7 @@
 #include "src/sandbox/external-pointer.h"
 #include "src/utils/allocation.h"
 
-#ifdef V8_SANDBOX_IS_AVAILABLE
+#ifdef V8_ENABLE_SANDBOX
 
 namespace v8 {
 namespace internal {
@@ -42,7 +42,7 @@ void ExternalPointerTable::Init(Isolate* isolate) {
 
   // Set up the special null entry. This entry must contain nullptr so that
   // empty EmbedderDataSlots represent nullptr.
-  STATIC_ASSERT(kNullExternalPointer == 0);
+  static_assert(kNullExternalPointer == 0);
   store(kNullExternalPointer, kNullAddress);
 }
 
@@ -59,8 +59,9 @@ void ExternalPointerTable::TearDown() {
   mutex_ = nullptr;
 }
 
-Address ExternalPointerTable::Get(uint32_t index,
+Address ExternalPointerTable::Get(ExternalPointerHandle handle,
                                   ExternalPointerTag tag) const {
+  uint32_t index = handle >> kExternalPointerIndexShift;
   DCHECK_LT(index, capacity_);
 
   Address entry = load_atomic(index);
@@ -69,17 +70,33 @@ Address ExternalPointerTable::Get(uint32_t index,
   return entry & ~tag;
 }
 
-void ExternalPointerTable::Set(uint32_t index, Address value,
+void ExternalPointerTable::Set(ExternalPointerHandle handle, Address value,
                                ExternalPointerTag tag) {
-  DCHECK_LT(index, capacity_);
-  DCHECK_NE(kNullExternalPointer, index);
+  DCHECK_NE(kNullExternalPointer, handle);
   DCHECK_EQ(0, value & kExternalPointerTagMask);
   DCHECK(is_marked(tag));
+
+  uint32_t index = handle >> kExternalPointerIndexShift;
+  DCHECK_LT(index, capacity_);
 
   store_atomic(index, value | tag);
 }
 
-uint32_t ExternalPointerTable::Allocate() {
+Address ExternalPointerTable::Exchange(ExternalPointerHandle handle,
+                                       Address value, ExternalPointerTag tag) {
+  DCHECK_NE(kNullExternalPointer, handle);
+  DCHECK_EQ(0, value & kExternalPointerTagMask);
+  DCHECK(is_marked(tag));
+
+  uint32_t index = handle >> kExternalPointerIndexShift;
+  DCHECK_LT(index, capacity_);
+
+  Address entry = exchange_atomic(index, value | tag);
+  DCHECK(!is_free(entry));
+  return entry & ~tag;
+}
+
+ExternalPointerHandle ExternalPointerTable::Allocate() {
   DCHECK(is_initialized());
 
   base::Atomic32* freelist_head_ptr =
@@ -120,12 +137,14 @@ uint32_t ExternalPointerTable::Allocate() {
     success = old_val == freelist_head;
   }
 
-  return index;
+  return index << kExternalPointerIndexShift;
 }
 
-void ExternalPointerTable::Mark(uint32_t index) {
+void ExternalPointerTable::Mark(ExternalPointerHandle handle) {
+  static_assert(sizeof(base::Atomic64) == sizeof(Address));
+
+  uint32_t index = handle >> kExternalPointerIndexShift;
   DCHECK_LT(index, capacity_);
-  STATIC_ASSERT(sizeof(base::Atomic64) == sizeof(Address));
 
   base::Atomic64 old_val = load_atomic(index);
   DCHECK(!is_free(old_val));
@@ -144,6 +163,6 @@ void ExternalPointerTable::Mark(uint32_t index) {
 }  // namespace internal
 }  // namespace v8
 
-#endif  // V8_SANDBOX_IS_AVAILABLE
+#endif  // V8_ENABLE_SANDBOX
 
 #endif  // V8_SANDBOX_EXTERNAL_POINTER_TABLE_INL_H_

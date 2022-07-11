@@ -12,7 +12,6 @@
 #include "src/codegen/aligned-slot-allocator.h"
 #include "src/codegen/assembler-arch.h"
 #include "src/codegen/machine-type.h"
-#include "src/codegen/signature.h"
 #include "src/wasm/value-type.h"
 
 namespace v8 {
@@ -143,6 +142,8 @@ constexpr DoubleRegister kFpReturnRegisters[] = {};
 // The parameter index where the instance parameter should be placed in wasm
 // call descriptors. This is used by the Int64Lowering::LowerNode method.
 constexpr int kWasmInstanceParameterIndex = 0;
+static_assert(kWasmInstanceRegister ==
+              kGpParamRegisters[kWasmInstanceParameterIndex]);
 
 class LinkageAllocator {
  public:

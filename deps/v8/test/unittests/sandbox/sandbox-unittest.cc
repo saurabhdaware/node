@@ -9,7 +9,7 @@
 #include "src/base/virtual-address-space.h"
 #include "test/unittests/test-utils.h"
 
-#ifdef V8_SANDBOX_IS_AVAILABLE
+#ifdef V8_ENABLE_SANDBOX
 
 namespace v8 {
 namespace internal {
@@ -101,7 +101,11 @@ TEST(SandboxTest, Contains) {
   sandbox.TearDown();
 }
 
-void TestPageAllocationInSandbox(Sandbox& sandbox) {
+TEST(SandboxTest, PageAllocation) {
+  base::VirtualAddressSpace root_vas;
+  Sandbox sandbox;
+  EXPECT_TRUE(sandbox.Initialize(&root_vas));
+
   const size_t kAllocatinSizesInPages[] = {1, 1, 2, 3, 5, 8, 13, 21, 34};
   constexpr int kNumAllocations = arraysize(kAllocatinSizesInPages);
 
@@ -122,29 +126,6 @@ void TestPageAllocationInSandbox(Sandbox& sandbox) {
     size_t length = allocation_granularity * kAllocatinSizesInPages[i];
     vas->FreePages(allocations[i], length);
   }
-}
-
-TEST(SandboxTest, PageAllocation) {
-  base::VirtualAddressSpace vas;
-  Sandbox sandbox;
-  EXPECT_TRUE(sandbox.Initialize(&vas));
-
-  TestPageAllocationInSandbox(sandbox);
-
-  sandbox.TearDown();
-}
-
-TEST(SandboxTest, PartiallyReservedSandboxPageAllocation) {
-  base::VirtualAddressSpace vas;
-  Sandbox sandbox;
-  size_t size = kSandboxSize;
-  // Only reserve two pages so the test will allocate memory inside and outside
-  // of the reserved region.
-  size_t reserved_size = 2 * vas.allocation_granularity();
-  EXPECT_TRUE(
-      sandbox.InitializeAsPartiallyReservedSandbox(&vas, size, reserved_size));
-
-  TestPageAllocationInSandbox(sandbox);
 
   sandbox.TearDown();
 }
@@ -152,4 +133,4 @@ TEST(SandboxTest, PartiallyReservedSandboxPageAllocation) {
 }  // namespace internal
 }  // namespace v8
 
-#endif  // V8_SANDBOX_IS_AVAILABLE
+#endif  // V8_ENABLE_SANDBOX

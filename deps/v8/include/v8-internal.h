@@ -157,7 +157,7 @@ V8_INLINE static constexpr internal::Address IntToSmi(int value) {
  * Sandbox related types, constants, and functions.
  */
 constexpr bool SandboxIsEnabled() {
-#ifdef V8_SANDBOX
+#ifdef V8_ENABLE_SANDBOX
   return true;
 #else
   return false;
@@ -176,19 +176,36 @@ constexpr bool SandboxedExternalPointersAreEnabled() {
 // for example by storing them as offset rather than as raw pointers.
 using SandboxedPointer_t = Address;
 
-// ExternalPointers point to objects located outside the sandbox. When sandboxed
-// external pointers are enabled, these are stored in an external pointer table
-// and referenced from HeapObjects through indices.
+// A ExternalPointerHandle represents a (opaque) reference to an external
+// pointer that can be stored inside the sandbox. A ExternalPointerHandle has
+// meaning only in combination with an (active) Isolate as it references an
+// external pointer stored in the currently active Isolate's
+// ExternalPointerTable. Internally, an ExternalPointerHandles is simply an
+// index into an ExternalPointerTable that is shifted to the left to guarantee
+// that it is smaller than the size of the table.
+using ExternalPointerHandle = uint32_t;
+
+// ExternalPointers point to objects located outside the sandbox. When
+// sandboxed external pointers are enabled, these are stored on heap as
+// ExternalPointerHandles, otherwise they are simply raw pointers.
 #ifdef V8_SANDBOXED_EXTERNAL_POINTERS
-using ExternalPointer_t = uint32_t;
+using ExternalPointer_t = ExternalPointerHandle;
 #else
 using ExternalPointer_t = Address;
 #endif
 
-#ifdef V8_SANDBOX_IS_AVAILABLE
+#ifdef V8_ENABLE_SANDBOX
 
 // Size of the sandbox, excluding the guard regions surrounding it.
+#ifdef V8_TARGET_OS_ANDROID
+// On Android, most 64-bit devices seem to be configured with only 39 bits of
+// virtual address space for userspace. As such, limit the sandbox to 128GB (a
+// quarter of the total available address space).
+constexpr size_t kSandboxSizeLog2 = 37;  // 128 GB
+#else
+// Everywhere else use a 1TB sandbox.
 constexpr size_t kSandboxSizeLog2 = 40;  // 1 TB
+#endif  // V8_OS_ANDROID
 constexpr size_t kSandboxSize = 1ULL << kSandboxSizeLog2;
 
 // Required alignment of the sandbox. For simplicity, we require the
@@ -276,7 +293,7 @@ static_assert((1 << (32 - kExternalPointerIndexShift)) ==
               "kExternalPointerTableReservationSize and "
               "kExternalPointerIndexShift don't match");
 
-#endif  // V8_SANDBOX_IS_AVAILABLE
+#endif  // V8_ENABLE_SANDBOX
 
 // If sandboxed external pointers are enabled, these tag values will be ORed
 // with the external pointers in the external pointer table to prevent use of
@@ -296,25 +313,70 @@ static_assert((1 << (32 - kExternalPointerIndexShift)) ==
 constexpr uint64_t kExternalPointerTagMask = 0xffff000000000000;
 constexpr uint64_t kExternalPointerTagShift = 48;
 #define MAKE_TAG(v) (static_cast<uint64_t>(v) << kExternalPointerTagShift)
-// clang-format off
-enum ExternalPointerTag : uint64_t {
-  kExternalPointerNullTag =         MAKE_TAG(0b0000000000000000),
-  kExternalPointerFreeEntryTag =    MAKE_TAG(0b0111111110000000),
-  kExternalStringResourceTag =      MAKE_TAG(0b1000000011111111),
-  kExternalStringResourceDataTag =  MAKE_TAG(0b1000000101111111),
-  kForeignForeignAddressTag =       MAKE_TAG(0b1000000110111111),
-  kNativeContextMicrotaskQueueTag = MAKE_TAG(0b1000000111011111),
-  kEmbedderDataSlotPayloadTag =     MAKE_TAG(0b1000000111101111),
-  kCodeEntryPointTag =              MAKE_TAG(0b1000000111110111),
-  kExternalObjectValueTag =         MAKE_TAG(0b1000000111111011),
-};
-// clang-format on
-#undef MAKE_TAG
 
-// Converts encoded external pointer to address.
-V8_EXPORT Address DecodeExternalPointerImpl(const Isolate* isolate,
-                                            ExternalPointer_t pointer,
-                                            ExternalPointerTag tag);
+// clang-format off
+#define EXTERNAL_POINTER_TAGS(V)                          \
+  V(kExternalPointerNullTag,          0b0000000000000000) \
+  V(kExternalPointerFreeEntryTag,     0b0011111100000000) \
+  V(kForeignForeignAddressTag,        0b1000001110111111) \
+  V(kNativeContextMicrotaskQueueTag,  0b1000001111011111) \
+  V(kEmbedderDataSlotPayloadTag,      0b1000001111101111) \
+  V(kCodeEntryPointTag,               0b1000001111110111) \
+  V(kExternalObjectValueTag,          0b1000001111111011) \
+  V(kCallHandlerInfoCallbackTag,      0b1000001111111101) \
+  V(kCallHandlerInfoJsCallbackTag,    0b1000001111111110) \
+  V(kAccessorInfoGetterTag,           0b1000010011111111) \
+  V(kAccessorInfoJsGetterTag,         0b1000010101111111) \
+  V(kAccessorInfoSetterTag,           0b1000010110111111)
+
+// Shared external pointers can be access from shared isolates. They are stored
+// in a shared external pointer table.
+// The second most significant bit indicates that a tag is shared. If we ever
+// can't afford to reserve the bit to indicate shared tags, the only invariant
+// is that kSharedExternalObjectMask and kSharedExternalObjectTag can
+// distinguish shared from non-shared tags.
+#define SHARED_EXTERNAL_POINTER_TAGS(V)                 \
+  V(kWaiterQueueNodeTag,            0b1100000111111111) \
+  V(kExternalStringResourceTag,     0b1100001011111111) \
+  V(kExternalStringResourceDataTag, 0b1100001101111111)
+
+constexpr uint64_t kSharedExternalObjectMask = MAKE_TAG(0b1100000000000000);
+constexpr uint64_t kSharedExternalObjectTag  = MAKE_TAG(0b1100000000000000);
+
+#define EXTERNAL_POINTER_TAG_ENUM(Name, Bits) Name = MAKE_TAG(Bits),
+
+enum ExternalPointerTag : uint64_t {
+  EXTERNAL_POINTER_TAGS(EXTERNAL_POINTER_TAG_ENUM)
+  SHARED_EXTERNAL_POINTER_TAGS(EXTERNAL_POINTER_TAG_ENUM)
+};
+
+// clang-format on
+
+#undef MAKE_TAG
+#undef EXTERNAL_POINTER_TAG_ENUM
+
+// Sanity checks.
+#define CHECK_SHARED_EXTERNAL_POINTER_TAGS(Tag, ...) \
+  static_assert((Tag & kSharedExternalObjectMask) == kSharedExternalObjectTag);
+#define CHECK_NON_SHARED_EXTERNAL_POINTER_TAGS(Tag, ...) \
+  static_assert((Tag & kSharedExternalObjectMask) != kSharedExternalObjectTag);
+
+SHARED_EXTERNAL_POINTER_TAGS(CHECK_SHARED_EXTERNAL_POINTER_TAGS)
+EXTERNAL_POINTER_TAGS(CHECK_NON_SHARED_EXTERNAL_POINTER_TAGS)
+
+#undef CHECK_NON_SHARED_EXTERNAL_POINTER_TAGS
+#undef CHECK_SHARED_EXTERNAL_POINTER_TAGS
+
+#undef SHARED_EXTERNAL_POINTER_TAGS
+#undef EXTERNAL_POINTER_TAGS
+
+#ifdef V8_SANDBOXED_EXTERNAL_POINTERS
+// True if the external resource can be accessed from shared isolates.
+V8_INLINE static constexpr bool IsExternalPointerTagShareable(
+    ExternalPointerTag tag) {
+  return (tag & kSharedExternalObjectMask) == kSharedExternalObjectTag;
+}
+#endif  // V8_SANDBOXED_EXTERNAL_POINTERS
 
 // {obj} must be the raw tagged pointer representation of a HeapObject
 // that's guaranteed to never be in ReadOnlySpace.
@@ -324,9 +386,6 @@ V8_EXPORT internal::Isolate* IsolateFromNeverReadOnlySpaceObject(Address obj);
 // mode based on the current context and the closure. This returns true if the
 // language mode is strict.
 V8_EXPORT bool ShouldThrowOnError(v8::internal::Isolate* isolate);
-
-V8_EXPORT bool CanHaveInternalField(int instance_type);
-
 /**
  * This class exports constants and functionality from within v8 that
  * is necessary to implement inline functions in the v8 api.  Don't
@@ -365,8 +424,19 @@ class Internals {
 
   static const uint32_t kNumIsolateDataSlots = 4;
   static const int kStackGuardSize = 7 * kApiSystemPointerSize;
-  static const int kBuiltinTier0EntryTableSize = 10 * kApiSystemPointerSize;
-  static const int kBuiltinTier0TableSize = 10 * kApiSystemPointerSize;
+  static const int kBuiltinTier0EntryTableSize = 7 * kApiSystemPointerSize;
+  static const int kBuiltinTier0TableSize = 7 * kApiSystemPointerSize;
+
+  // ExternalPointerTable layout guarantees.
+  static const int kExternalPointerTableBufferOffset = 0;
+  static const int kExternalPointerTableCapacityOffset =
+      kExternalPointerTableBufferOffset + kApiSystemPointerSize;
+  static const int kExternalPointerTableFreelistHeadOffset =
+      kExternalPointerTableCapacityOffset + kApiInt32Size;
+  static const int kExternalPointerTableMutexOffset =
+      kExternalPointerTableFreelistHeadOffset + kApiInt32Size;
+  static const int kExternalPointerTableSize =
+      kExternalPointerTableMutexOffset + kApiSystemPointerSize;
 
   // IsolateData layout guarantees.
   static const int kIsolateCageBaseOffset = 0;
@@ -386,14 +456,17 @@ class Internals {
       kIsolateFastCCallCallerPcOffset + kApiSystemPointerSize;
   static const int kIsolateLongTaskStatsCounterOffset =
       kIsolateFastApiCallTargetOffset + kApiSystemPointerSize;
+#ifdef V8_SANDBOXED_EXTERNAL_POINTERS
+  static const int kIsolateExternalPointerTableOffset =
+      kIsolateLongTaskStatsCounterOffset + kApiSizetSize;
+  static const int kIsolateSharedExternalPointerTableAddressOffset =
+      kIsolateExternalPointerTableOffset + kExternalPointerTableSize;
+  static const int kIsolateRootsOffset =
+      kIsolateSharedExternalPointerTableAddressOffset + kApiSystemPointerSize;
+#else
   static const int kIsolateRootsOffset =
       kIsolateLongTaskStatsCounterOffset + kApiSizetSize;
-
-  static const int kExternalPointerTableBufferOffset = 0;
-  static const int kExternalPointerTableCapacityOffset =
-      kExternalPointerTableBufferOffset + kApiSystemPointerSize;
-  static const int kExternalPointerTableFreelistHeadOffset =
-      kExternalPointerTableCapacityOffset + kApiInt32Size;
+#endif
 
   static const int kUndefinedValueRootIndex = 4;
   static const int kTheHoleValueRootIndex = 5;
@@ -406,7 +479,6 @@ class Internals {
   static const int kNodeFlagsOffset = 1 * kApiSystemPointerSize + 3;
   static const int kNodeStateMask = 0x7;
   static const int kNodeStateIsWeakValue = 2;
-  static const int kNodeStateIsPendingValue = 3;
 
   static const int kFirstNonstringType = 0x80;
   static const int kOddballType = 0x83;
@@ -481,6 +553,18 @@ class Internals {
     return representation == kExternalTwoByteRepresentationTag;
   }
 
+  V8_INLINE static constexpr bool CanHaveInternalField(int instance_type) {
+    static_assert(kJSObjectType + 1 == kFirstJSApiObjectType);
+    static_assert(kJSObjectType < kLastJSApiObjectType);
+    static_assert(kFirstJSApiObjectType < kLastJSApiObjectType);
+    // Check for IsJSObject() || IsJSSpecialApiObject() || IsJSApiObject()
+    return instance_type == kJSSpecialApiObjectType ||
+           // inlined version of base::IsInRange
+           (static_cast<unsigned>(static_cast<unsigned>(instance_type) -
+                                  static_cast<unsigned>(kJSObjectType)) <=
+            static_cast<unsigned>(kLastJSApiObjectType - kJSObjectType));
+  }
+
   V8_INLINE static uint8_t GetNodeFlag(internal::Address* obj, int shift) {
     uint8_t* addr = reinterpret_cast<uint8_t*>(obj) + kNodeFlagsOffset;
     return *addr & static_cast<uint8_t>(1U << shift);
@@ -532,6 +616,25 @@ class Internals {
     return reinterpret_cast<internal::Address*>(addr);
   }
 
+#ifdef V8_SANDBOXED_EXTERNAL_POINTERS
+  V8_INLINE static internal::Address* GetExternalPointerTableBase(
+      v8::Isolate* isolate) {
+    internal::Address addr = reinterpret_cast<internal::Address>(isolate) +
+                             kIsolateExternalPointerTableOffset +
+                             kExternalPointerTableBufferOffset;
+    return *reinterpret_cast<internal::Address**>(addr);
+  }
+
+  V8_INLINE static internal::Address* GetSharedExternalPointerTableBase(
+      v8::Isolate* isolate) {
+    internal::Address addr = reinterpret_cast<internal::Address>(isolate) +
+                             kIsolateSharedExternalPointerTableAddressOffset;
+    addr = *reinterpret_cast<internal::Address*>(addr);
+    addr += kExternalPointerTableBufferOffset;
+    return *reinterpret_cast<internal::Address**>(addr);
+  }
+#endif
+
   template <typename T>
   V8_INLINE static T ReadRawField(internal::Address heap_object_ptr,
                                   int offset) {
@@ -572,35 +675,29 @@ class Internals {
 #endif
   }
 
-  V8_INLINE static internal::Isolate* GetIsolateForSandbox(
-      internal::Address obj) {
+  V8_INLINE static v8::Isolate* GetIsolateForSandbox(internal::Address obj) {
 #ifdef V8_SANDBOXED_EXTERNAL_POINTERS
-    return internal::IsolateFromNeverReadOnlySpaceObject(obj);
+    return reinterpret_cast<v8::Isolate*>(
+        internal::IsolateFromNeverReadOnlySpaceObject(obj));
 #else
     // Not used in non-sandbox mode.
     return nullptr;
 #endif
   }
 
-  V8_INLINE static Address DecodeExternalPointer(
-      const Isolate* isolate, ExternalPointer_t encoded_pointer,
-      ExternalPointerTag tag) {
-#ifdef V8_SANDBOXED_EXTERNAL_POINTERS
-    return internal::DecodeExternalPointerImpl(isolate, encoded_pointer, tag);
-#else
-    return encoded_pointer;
-#endif
-  }
-
+  template <ExternalPointerTag tag>
   V8_INLINE static internal::Address ReadExternalPointerField(
-      internal::Isolate* isolate, internal::Address heap_object_ptr, int offset,
-      ExternalPointerTag tag) {
+      v8::Isolate* isolate, internal::Address heap_object_ptr, int offset) {
 #ifdef V8_SANDBOXED_EXTERNAL_POINTERS
+    // See src/sandbox/external-pointer-table-inl.h. Logic duplicated here so it
+    // can be inlined in embedder code and doesn't require an additional call.
+    internal::Address* table = IsExternalPointerTagShareable(tag)
+                                   ? GetSharedExternalPointerTableBase(isolate)
+                                   : GetExternalPointerTableBase(isolate);
     internal::ExternalPointer_t encoded_value =
-        ReadRawField<uint32_t>(heap_object_ptr, offset);
-    // We currently have to treat zero as nullptr in embedder slots.
-    return encoded_value ? DecodeExternalPointer(isolate, encoded_value, tag)
-                         : 0;
+        ReadRawField<ExternalPointer_t>(heap_object_ptr, offset);
+    uint32_t index = encoded_value >> kExternalPointerIndexShift;
+    return table[index] & ~tag;
 #else
     return ReadRawField<Address>(heap_object_ptr, offset);
 #endif

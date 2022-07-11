@@ -5,7 +5,6 @@
 #ifndef V8_SNAPSHOT_SERIALIZER_DESERIALIZER_H_
 #define V8_SNAPSHOT_SERIALIZER_DESERIALIZER_H_
 
-#include "src/common/assert-scope.h"
 #include "src/objects/visitors.h"
 #include "src/snapshot/references.h"
 
@@ -68,7 +67,7 @@ class SerializerDeserializer : public RootVisitor {
   // The static assert below will trigger when the number of preallocated spaces
   // changed. If that happens, update the kNewObject and kBackref bytecode
   // ranges in the comments below.
-  STATIC_ASSERT(4 == kNumberOfSnapshotSpaces);
+  static_assert(4 == kNumberOfSnapshotSpaces);
 
   // First 32 root array items.
   static const int kRootArrayConstantsCount = 0x20;
@@ -186,7 +185,7 @@ class SerializerDeserializer : public RootVisitor {
   template <Bytecode kBytecode, int kMinValue, int kMaxValue,
             typename TValue = int>
   struct BytecodeValueEncoder {
-    STATIC_ASSERT((kBytecode + kMaxValue - kMinValue) <= kMaxUInt8);
+    static_assert((kBytecode + kMaxValue - kMinValue) <= kMaxUInt8);
 
     static constexpr bool IsEncodable(TValue value) {
       return base::IsInRange(static_cast<int>(value), kMinValue, kMaxValue);

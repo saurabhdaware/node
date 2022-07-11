@@ -626,6 +626,11 @@ LiftoffRegister LiftoffAssembler::LoadToRegister(VarState slot,
                                                  LiftoffRegList pinned) {
   if (slot.is_reg()) return slot.reg();
   LiftoffRegister reg = GetUnusedRegister(reg_class_for(slot.kind()), pinned);
+  return LoadToRegister(slot, reg);
+}
+
+LiftoffRegister LiftoffAssembler::LoadToRegister(VarState slot,
+                                                 LiftoffRegister reg) {
   if (slot.is_const()) {
     LoadConstant(reg, slot.constant());
   } else {
@@ -1184,6 +1189,10 @@ void LiftoffAssembler::MoveToReturnLocations(
   // original state in case it is needed after the current instruction
   // (conditional branch).
   CacheState saved_state;
+#if DEBUG
+  uint32_t saved_state_frozenness = cache_state_.frozen;
+  cache_state_.frozen = 0;
+#endif
   saved_state.Split(*cache_state());
   int call_desc_return_idx = 0;
   DCHECK_LE(sig->return_count(), cache_state_.stack_height());
@@ -1236,6 +1245,9 @@ void LiftoffAssembler::MoveToReturnLocations(
     }
   }
   cache_state()->Steal(saved_state);
+#if DEBUG
+  cache_state_.frozen = saved_state_frozenness;
+#endif
 }
 
 #ifdef ENABLE_SLOW_DCHECKS
@@ -1332,6 +1344,7 @@ LiftoffRegister LiftoffAssembler::SpillAdjacentFpRegisters(
 }
 
 void LiftoffAssembler::SpillRegister(LiftoffRegister reg) {
+  DCHECK(!cache_state_.frozen);
   int remaining_uses = cache_state_.get_use_count(reg);
   DCHECK_LT(0, remaining_uses);
   for (uint32_t idx = cache_state_.stack_height() - 1;; --idx) {
@@ -1382,7 +1395,7 @@ bool CheckCompatibleStackSlotTypes(ValueKind a, ValueKind b) {
   if (is_object_reference(a)) {
     // Since Liftoff doesn't do accurate type tracking (e.g. on loop back
     // edges), we only care that pointer types stay amongst pointer types.
-    // It's fine if ref/optref overwrite each other.
+    // It's fine if ref/ref null overwrite each other.
     DCHECK(is_object_reference(b));
   } else if (is_rtt(a)) {
     // Same for rtt/rtt_with_depth.

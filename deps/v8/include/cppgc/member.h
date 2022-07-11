@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <type_traits>
 
+#include "cppgc/internal/api-constants.h"
 #include "cppgc/internal/pointer-policies.h"
 #include "cppgc/sentinel-pointer.h"
 #include "cppgc/type-traits.h"
@@ -20,36 +21,198 @@ class Visitor;
 
 namespace internal {
 
+#if defined(CPPGC_POINTER_COMPRESSION)
+
+#if defined(__clang__)
+// Attribute const allows the compiler to assume that CageBaseGlobal::g_base_
+// doesn't change (e.g. across calls) and thereby avoid redundant loads.
+#define CPPGC_CONST __attribute__((const))
+#define CPPGC_REQUIRE_CONSTANT_INIT \
+  __attribute__((require_constant_initialization))
+#else  // defined(__clang__)
+#define CPPGC_CONST
+#define CPPGC_REQUIRE_CONSTANT_INIT
+#endif  // defined(__clang__)
+
+class CageBaseGlobal final {
+ public:
+  V8_INLINE CPPGC_CONST static uintptr_t Get() {
+    CPPGC_DCHECK(IsBaseConsistent());
+    return g_base_;
+  }
+
+  V8_INLINE CPPGC_CONST static bool IsSet() {
+    CPPGC_DCHECK(IsBaseConsistent());
+    return (g_base_ & ~kLowerHalfWordMask) != 0;
+  }
+
+ private:
+  // We keep the lower halfword as ones to speed up decompression.
+  static constexpr uintptr_t kLowerHalfWordMask =
+      (api_constants::kCagedHeapReservationAlignment - 1);
+
+  static V8_EXPORT uintptr_t g_base_ CPPGC_REQUIRE_CONSTANT_INIT;
+
+  CageBaseGlobal() = delete;
+
+  V8_INLINE static bool IsBaseConsistent() {
+    return kLowerHalfWordMask == (g_base_ & kLowerHalfWordMask);
+  }
+
+  friend class CageBaseGlobalUpdater;
+};
+
+#undef CPPGC_REQUIRE_CONSTANT_INIT
+#undef CPPGC_CONST
+
+class CompressedPointer final {
+ public:
+  using Storage = uint32_t;
+
+  V8_INLINE CompressedPointer() : value_(0u) {}
+  V8_INLINE explicit CompressedPointer(const void* ptr)
+      : value_(Compress(ptr)) {}
+  V8_INLINE explicit CompressedPointer(std::nullptr_t) : value_(0u) {}
+  V8_INLINE explicit CompressedPointer(SentinelPointer)
+      : value_(kCompressedSentinel) {}
+
+  V8_INLINE const void* Load() const { return Decompress(value_); }
+  V8_INLINE const void* LoadAtomic() const {
+    return Decompress(
+        reinterpret_cast<const std::atomic<Storage>&>(value_).load(
+            std::memory_order_relaxed));
+  }
+
+  V8_INLINE void Store(const void* ptr) { value_ = Compress(ptr); }
+  V8_INLINE void StoreAtomic(const void* value) {
+    reinterpret_cast<std::atomic<Storage>&>(value_).store(
+        Compress(value), std::memory_order_relaxed);
+  }
+
+  V8_INLINE void Clear() { value_ = 0u; }
+  V8_INLINE bool IsCleared() const { return !value_; }
+
+  V8_INLINE friend bool operator==(CompressedPointer a, CompressedPointer b) {
+    return a.value_ == b.value_;
+  }
+
+  static V8_INLINE Storage Compress(const void* ptr) {
+    static_assert(
+        SentinelPointer::kSentinelValue == 0b10,
+        "The compression scheme relies on the sentinel encoded as 0b10");
+    static constexpr size_t kGigaCageMask =
+        ~(api_constants::kCagedHeapReservationAlignment - 1);
+
+    CPPGC_DCHECK(CageBaseGlobal::IsSet());
+    const uintptr_t base = CageBaseGlobal::Get();
+    CPPGC_DCHECK(!ptr || ptr == kSentinelPointer ||
+                 (base & kGigaCageMask) ==
+                     (reinterpret_cast<uintptr_t>(ptr) & kGigaCageMask));
+
+    const auto uptr = reinterpret_cast<uintptr_t>(ptr);
+    // Shift the pointer by one and truncate.
+    auto compressed = static_cast<Storage>(uptr >> 1);
+    // Normal compressed pointers must have the MSB set.
+    CPPGC_DCHECK((!compressed || compressed == kCompressedSentinel) ||
+                 (compressed & 0x80000000));
+    return compressed;
+  }
+
+  static V8_INLINE void* Decompress(Storage ptr) {
+    CPPGC_DCHECK(CageBaseGlobal::IsSet());
+    const uintptr_t base = CageBaseGlobal::Get();
+    // Treat compressed pointer as signed and cast it to uint64_t, which will
+    // sign-extend it. Then, shift the result by one. It's important to shift
+    // the unsigned value, as otherwise it would result in undefined behavior.
+    const uint64_t mask = static_cast<uint64_t>(static_cast<int32_t>(ptr)) << 1;
+    return reinterpret_cast<void*>(mask & base);
+  }
+
+ private:
+  static constexpr Storage kCompressedSentinel =
+      SentinelPointer::kSentinelValue >> 1;
+  // All constructors initialize `value_`. Do not add a default value here as it
+  // results in a non-atomic write on some builds, even when the atomic version
+  // of the constructor is used.
+  Storage value_;
+};
+
+#endif  // defined(CPPGC_POINTER_COMPRESSION)
+
+class RawPointer final {
+ public:
+  using Storage = uintptr_t;
+
+  RawPointer() : ptr_(nullptr) {}
+  explicit RawPointer(const void* ptr) : ptr_(ptr) {}
+
+  V8_INLINE const void* Load() const { return ptr_; }
+  V8_INLINE const void* LoadAtomic() const {
+    return reinterpret_cast<const std::atomic<const void*>&>(ptr_).load(
+        std::memory_order_relaxed);
+  }
+
+  V8_INLINE void Store(const void* ptr) { ptr_ = ptr; }
+  V8_INLINE void StoreAtomic(const void* ptr) {
+    reinterpret_cast<std::atomic<const void*>&>(ptr_).store(
+        ptr, std::memory_order_relaxed);
+  }
+
+  V8_INLINE void Clear() { ptr_ = nullptr; }
+  V8_INLINE bool IsCleared() const { return !ptr_; }
+
+  V8_INLINE friend bool operator==(RawPointer a, RawPointer b) {
+    return a.ptr_ == b.ptr_;
+  }
+
+ private:
+  // All constructors initialize `ptr_`. Do not add a default value here as it
+  // results in a non-atomic write on some builds, even when the atomic version
+  // of the constructor is used.
+  const void* ptr_;
+};
+
 // MemberBase always refers to the object as const object and defers to
 // BasicMember on casting to the right type as needed.
 class MemberBase {
  protected:
+#if defined(CPPGC_POINTER_COMPRESSION)
+  using RawStorage = CompressedPointer;
+#else   // !defined(CPPGC_POINTER_COMPRESSION)
+  using RawStorage = RawPointer;
+#endif  // !defined(CPPGC_POINTER_COMPRESSION)
+
   struct AtomicInitializerTag {};
 
-  MemberBase() : raw_(nullptr) {}
+  MemberBase() = default;
   explicit MemberBase(const void* value) : raw_(value) {}
   MemberBase(const void* value, AtomicInitializerTag) { SetRawAtomic(value); }
 
-  const void** GetRawSlot() const { return &raw_; }
-  const void* GetRaw() const { return raw_; }
-  void SetRaw(void* value) { raw_ = value; }
+  explicit MemberBase(RawStorage raw) : raw_(raw) {}
+  explicit MemberBase(std::nullptr_t) : raw_(nullptr) {}
+  explicit MemberBase(SentinelPointer s) : raw_(s) {}
 
-  const void* GetRawAtomic() const {
-    return reinterpret_cast<const std::atomic<const void*>*>(&raw_)->load(
-        std::memory_order_relaxed);
+  const void** GetRawSlot() const {
+    return reinterpret_cast<const void**>(const_cast<MemberBase*>(this));
   }
-  void SetRawAtomic(const void* value) {
-    reinterpret_cast<std::atomic<const void*>*>(&raw_)->store(
-        value, std::memory_order_relaxed);
+  const void* GetRaw() const { return raw_.Load(); }
+  void SetRaw(void* value) { raw_.Store(value); }
+
+  const void* GetRawAtomic() const { return raw_.LoadAtomic(); }
+  void SetRawAtomic(const void* value) { raw_.StoreAtomic(value); }
+
+  RawStorage GetRawStorage() const { return raw_; }
+  void SetRawStorageAtomic(RawStorage other) {
+    reinterpret_cast<std::atomic<RawStorage>&>(raw_).store(
+        other, std::memory_order_relaxed);
   }
 
-  void ClearFromGC() const { raw_ = nullptr; }
+  bool IsCleared() const { return raw_.IsCleared(); }
+
+  void ClearFromGC() const { raw_.Clear(); }
 
  private:
-  // All constructors initialize `raw_`. Do not add a default value here as it
-  // results in a non-atomic write on some builds, even when the atomic version
-  // of the constructor is used.
-  mutable const void* raw_;
+  mutable RawStorage raw_;
 };
 
 // The basic class from which all Member classes are 'generated'.
@@ -60,7 +223,7 @@ class BasicMember final : private MemberBase, private CheckingPolicy {
   using PointeeType = T;
 
   constexpr BasicMember() = default;
-  constexpr BasicMember(std::nullptr_t) {}     // NOLINT
+  constexpr BasicMember(std::nullptr_t) {}           // NOLINT
   BasicMember(SentinelPointer s) : MemberBase(s) {}  // NOLINT
   BasicMember(T* raw) : MemberBase(raw) {            // NOLINT
     InitializingWriteBarrier();
@@ -82,7 +245,7 @@ class BasicMember final : private MemberBase, private CheckingPolicy {
   BasicMember(T& raw, AtomicInitializerTag atomic)
       : BasicMember(&raw, atomic) {}
   // Copy ctor.
-  BasicMember(const BasicMember& other) : BasicMember(other.Get()) {}
+  BasicMember(const BasicMember& other) : BasicMember(other.GetRawStorage()) {}
   // Allow heterogeneous construction.
   template <typename U, typename OtherBarrierPolicy, typename OtherWeaknessTag,
             typename OtherCheckingPolicy,
@@ -90,9 +253,10 @@ class BasicMember final : private MemberBase, private CheckingPolicy {
   BasicMember(  // NOLINT
       const BasicMember<U, OtherWeaknessTag, OtherBarrierPolicy,
                         OtherCheckingPolicy>& other)
-      : BasicMember(other.Get()) {}
+      : BasicMember(other.GetRawStorage()) {}
   // Move ctor.
-  BasicMember(BasicMember&& other) noexcept : BasicMember(other.Get()) {
+  BasicMember(BasicMember&& other) noexcept
+      : BasicMember(other.GetRawStorage()) {
     other.Clear();
   }
   // Allow heterogeneous move construction.
@@ -101,7 +265,7 @@ class BasicMember final : private MemberBase, private CheckingPolicy {
             typename = std::enable_if_t<std::is_base_of<T, U>::value>>
   BasicMember(BasicMember<U, OtherWeaknessTag, OtherBarrierPolicy,
                           OtherCheckingPolicy>&& other) noexcept
-      : BasicMember(other.Get()) {
+      : BasicMember(other.GetRawStorage()) {
     other.Clear();
   }
   // Construction from Persistent.
@@ -116,7 +280,7 @@ class BasicMember final : private MemberBase, private CheckingPolicy {
 
   // Copy assignment.
   BasicMember& operator=(const BasicMember& other) {
-    return operator=(other.Get());
+    return operator=(other.GetRawStorage());
   }
   // Allow heterogeneous copy assignment.
   template <typename U, typename OtherWeaknessTag, typename OtherBarrierPolicy,
@@ -125,11 +289,11 @@ class BasicMember final : private MemberBase, private CheckingPolicy {
   BasicMember& operator=(
       const BasicMember<U, OtherWeaknessTag, OtherBarrierPolicy,
                         OtherCheckingPolicy>& other) {
-    return operator=(other.Get());
+    return operator=(other.GetRawStorage());
   }
   // Move assignment.
   BasicMember& operator=(BasicMember&& other) noexcept {
-    operator=(other.Get());
+    operator=(other.GetRawStorage());
     other.Clear();
     return *this;
   }
@@ -139,7 +303,7 @@ class BasicMember final : private MemberBase, private CheckingPolicy {
             typename = std::enable_if_t<std::is_base_of<T, U>::value>>
   BasicMember& operator=(BasicMember<U, OtherWeaknessTag, OtherBarrierPolicy,
                                      OtherCheckingPolicy>&& other) noexcept {
-    operator=(other.Get());
+    operator=(other.GetRawStorage());
     other.Clear();
     return *this;
   }
@@ -173,12 +337,12 @@ class BasicMember final : private MemberBase, private CheckingPolicy {
             typename OtherCheckingPolicy>
   void Swap(BasicMember<T, OtherWeaknessTag, OtherBarrierPolicy,
                         OtherCheckingPolicy>& other) {
-    T* tmp = Get();
+    auto tmp = GetRawStorage();
     *this = other;
     other = tmp;
   }
 
-  explicit operator bool() const { return Get(); }
+  explicit operator bool() const { return !IsCleared(); }
   operator T*() const { return Get(); }
   T* operator->() const { return Get(); }
   T& operator*() const { return *Get(); }
@@ -195,7 +359,7 @@ class BasicMember final : private MemberBase, private CheckingPolicy {
     return static_cast<T*>(const_cast<void*>(MemberBase::GetRaw()));
   }
 
-  void Clear() { SetRawAtomic(nullptr); }
+  void Clear() { SetRawStorageAtomic(RawStorage{}); }
 
   T* Release() {
     T* result = Get();
@@ -208,6 +372,18 @@ class BasicMember final : private MemberBase, private CheckingPolicy {
   }
 
  private:
+  explicit BasicMember(RawStorage raw) : MemberBase(raw) {
+    InitializingWriteBarrier();
+    this->CheckPointer(Get());
+  }
+
+  BasicMember& operator=(RawStorage other) {
+    SetRawStorageAtomic(other);
+    AssigningWriteBarrier();
+    this->CheckPointer(Get());
+    return *this;
+  }
+
   const T* GetRawAtomic() const {
     return static_cast<const T*>(MemberBase::GetRawAtomic());
   }
@@ -226,6 +402,17 @@ class BasicMember final : private MemberBase, private CheckingPolicy {
   friend class cppgc::Visitor;
   template <typename U>
   friend struct cppgc::TraceTrait;
+  template <typename T1, typename WeaknessTag1, typename WriteBarrierPolicy1,
+            typename CheckingPolicy1>
+  friend class BasicMember;
+  template <typename T1, typename WeaknessTag1, typename WriteBarrierPolicy1,
+            typename CheckingPolicy1, typename T2, typename WeaknessTag2,
+            typename WriteBarrierPolicy2, typename CheckingPolicy2>
+  friend bool operator==(
+      const BasicMember<T1, WeaknessTag1, WriteBarrierPolicy1, CheckingPolicy1>&
+          member1,
+      const BasicMember<T2, WeaknessTag2, WriteBarrierPolicy2, CheckingPolicy2>&
+          member2);
 };
 
 template <typename T1, typename WeaknessTag1, typename WriteBarrierPolicy1,
@@ -235,7 +422,7 @@ bool operator==(const BasicMember<T1, WeaknessTag1, WriteBarrierPolicy1,
                                   CheckingPolicy1>& member1,
                 const BasicMember<T2, WeaknessTag2, WriteBarrierPolicy2,
                                   CheckingPolicy2>& member2) {
-  return member1.Get() == member2.Get();
+  return member1.GetRawStorage() == member2.GetRawStorage();
 }
 
 template <typename T1, typename WeaknessTag1, typename WriteBarrierPolicy1,

@@ -13,6 +13,7 @@
 #include "src/heap/spaces.h"
 #include "src/objects/objects.h"
 #include "src/objects/smi.h"
+#include "src/sandbox/external-pointer-inl.h"
 
 namespace v8 {
 namespace internal {
@@ -140,6 +141,19 @@ void MarkingVisitorBase<ConcreteVisitor, MarkingState>::VisitCodeTarget(
   concrete_visitor()->RecordRelocSlot(host, rinfo, target);
 }
 
+template <typename ConcreteVisitor, typename MarkingState>
+void MarkingVisitorBase<ConcreteVisitor, MarkingState>::VisitExternalPointer(
+    HeapObject host, ExternalPointerSlot slot, ExternalPointerTag tag) {
+#ifdef V8_SANDBOXED_EXTERNAL_POINTERS
+  ExternalPointerHandle handle = slot.load_handle();
+  if (IsExternalPointerTagShareable(tag)) {
+    shared_external_pointer_table_->Mark(handle);
+  } else {
+    external_pointer_table_->Mark(handle);
+  }
+#endif  // V8_SANDBOXED_EXTERNAL_POINTERS
+}
+
 // ===========================================================================
 // Object participating in bytecode flushing =================================
 // ===========================================================================
@@ -220,7 +234,7 @@ int MarkingVisitorBase<ConcreteVisitor, MarkingState>::
     VisitFixedArrayWithProgressBar(Map map, FixedArray object,
                                    ProgressBar& progress_bar) {
   const int kProgressBarScanningChunk = kMaxRegularHeapObjectSize;
-  STATIC_ASSERT(kMaxRegularHeapObjectSize % kTaggedSize == 0);
+  static_assert(kMaxRegularHeapObjectSize % kTaggedSize == 0);
   DCHECK(concrete_visitor()->marking_state()->IsBlackOrGrey(object));
   concrete_visitor()->marking_state()->GreyToBlack(object);
   int size = FixedArray::BodyDescriptor::SizeOf(map, object);
